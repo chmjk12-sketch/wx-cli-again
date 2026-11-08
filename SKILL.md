@@ -59,6 +59,21 @@ cd /path/to/wx-cli && git pull && cargo build --release && cp target/release/wx 
 - **不要**依赖公开 npm `@jackwener/wx-cli`（registry 上可能是旧版本）
 - 匿名 curl `install.sh` 在 private 仓库下会 404
 
+### 公开渠道（无仓库读权限时）
+
+```bash
+# 方式一：npm
+npm install -g @jackwener/wx-cli
+
+# 方式二：curl
+curl -fsSL https://raw.githubusercontent.com/jackwener/wx-cli/main/install.sh | bash
+
+# 验证
+wx --version
+```
+
+> 公开渠道发布的是某一时刻的快照，可能落后于 private 仓库。要跟最新代码一致，用上面的源码构建方式。
+
 ---
 
 ## 初始化（首次使用，只需一次）
@@ -81,6 +96,37 @@ sudo wx key extract --hook-seconds 90
 `wx init` 会：检测数据目录 → 内存扫描 + LLDB hook 取 per-DB 密钥 → 写入 `~/.wx-cli/config.json` 与 `all_keys.json`。
 
 **不要**默认执行 `codesign --force --deep --sign - /Applications/WeChat.app`：会打乱 TCC，导致截图/公众号等权限异常。仅 SSH 等无 GUI 场景下 attach 失败时才考虑有副作用的重签。
+
+#### macOS 分级路径（按顺序尝试，失败再降级）
+
+| 顺序 | 场景 | 做法 |
+|------|------|------|
+| 1 | 官方 DMG 版微信 | 本机 GUI Terminal + `sudo wx init`，通常直接通过 |
+| 2 | 出现 `task_for_pid 失败 (kr=5)` | 确认是否 App Store 沙盒版，若是转第 3 步 |
+| 3 | App Store 沙盒版（`app-sandbox=true` + 文件带 `compressed`） | 复制 bundle → 去 entitlement 重签 → 替换 |
+
+第 3 步核心动作（完整步骤、成因与回滚见 `docs/macos-permission-guide.md` 第七节）：
+
+```bash
+killall WeChat; sleep 2
+cp -R /Applications/WeChat.app /Applications/WeChat-adhoc.app     # cp -R 会解压 UF_COMPRESSED
+codesign --force --deep --sign - /Applications/WeChat-adhoc.app   # 不要加 --preserve-metadata=entitlements
+mv /Applications/WeChat.app ~/WeChat.official-backup
+mv /Applications/WeChat-adhoc.app /Applications/WeChat.app
+```
+
+重签后**必须**清 TCC 旧授权，否则截图/摄像头等权限静默失效：
+
+```bash
+for s in ScreenCapture Camera Microphone AppleEvents AddressBook \
+         SystemPolicyDocumentsFolder SystemPolicyDownloadsFolder SystemPolicyDesktopFolder; do
+  tccutil reset "$s" com.tencent.xinWeChat
+done
+```
+
+之后重启微信并按 GUI 提示重新允许。macOS 的「录屏」要加在**上半区（录屏与系统录音）**，只勾下半区「仅系统录音」无效。去沙盒后微信失去沙盒隔离，这是安全上的实际权衡。
+
+取密钥时若 root 枚举到 0 个库（`ls` 该目录返回 0 行），是 TCC 完全磁盘访问问题，用硬链接探针目录绕过，做法见 `docs/macos-permission-guide.md`。
 
 ### Linux
 
@@ -361,7 +407,15 @@ CHAT 参数支持昵称、备注名、微信 ID，模糊匹配。不确定准确
 
 **是不是必须关 SIP？**：不是。SIP 开着即可；init 用本机 Terminal + sudo。
 
-**是不是必须 ad-hoc 重签微信？**：默认不需要。只有 SSH / 无 GUI 且 attach 失败时才考虑，且有副作用。
+**是不是必须 ad-hoc 重签微信？**：默认不需要。只有 SSH / 无 GUI 且 attach 失败时才考虑，且有副作用。例外：App Store 沙盒版微信（`app-sandbox=true`）在 `kr=5` 时只能走「复制 + 去 entitlement 重签」，详见 `docs/macos-permission-guide.md` 第七节。
+
+**`codesign` 报 `Operation not permitted`（subcomponent）**：不是权限问题，是 App Store 安装的文件带 `UF_COMPRESSED`，root 也无法就地写入。必须先 `cp -R` 复制（复制会解压）再签副本。
+
+**重签后微信启动失败（`RBSRequestErrorDomain Code=5` / `POSIX 153`）**：签名保留了 `com.apple.security.app-sandbox`，但 ad-hoc 没有 Team ID，amfid 拒绝启动。去掉 `--preserve-metadata=entitlements` 重签。
+
+**`config.json` 的 `db_dir` 该写哪一层**：写 `<xwechat_files>/<账号>/db_storage`。写到 `xwechat_files` 根或账号目录都会枚举到 0 个库。
+
+**报「无法解密 session.db」但密钥齐全**：daemon 缓存了旧密钥状态，`wx daemon stop` 后重跑即可。
 
 **微信重启后密钥失效 / 新分片没 key**：重新运行 `sudo wx key extract --hook-seconds 90`（微信必须正在运行；等待期间点开相关聊天）。
 

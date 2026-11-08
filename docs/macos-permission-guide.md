@@ -319,3 +319,122 @@ codesign --force --deep --sign - /Applications/WeChat.app
 
 长期方向：
 - 这条副作用的真正修复是把 `wx init` 重新设计成 `safe → assisted → invasive fallback` 三层：默认不动 WeChat，只有在前两条都不可行时才走 ad-hoc 重签，并先打出完整副作用清单让用户显式确认。在那之前，这是已知 trade-off。
+
+---
+
+## 七、App Store 沙盒版微信实测（macOS 15.0.1 / 微信 4.1.1）
+
+> 2026-11-08 单机实测记录。与 §一、§二 的默认结论不同，本场景下**重签名必须换做法**，否则 App 无法启动。
+
+### 环境
+
+| 项 | 值 |
+|------|------|
+| macOS | 15.0.1 (24A348) |
+| 微信 | 4.1.1，App Store 版本 |
+| 签名 | `flags=0x10000(runtime)`，`TeamIdentifier=5A4RE8SF68`，含 `com.apple.security.app-sandbox=true` |
+| wx-cli | 0.6.3（本仓库源码构建，与 `target/release/wx` 同 hash） |
+| 其他 | 用户属 `_developer` 组，`DevToolsSecurity -status` 为 enabled |
+
+### 四条路径的实测结果
+
+| 路径 | 结果 | 关键错误 |
+|------|------|---------|
+| 官方硬化签名 + 本机 GUI Terminal + `sudo wx init` | ❌ | `task_for_pid 失败 (kr=5)` |
+| 原地 `sudo codesign --force --deep --sign -` | ❌ | `Operation not permitted`（`In subcomponent: .../ilink2.framework`） |
+| 复制 bundle 后 `--preserve-metadata=entitlements` 重签 | ❌ | 签名成功但启动失败：`RBSRequestErrorDomain Code=5` / `POSIX 153` |
+| 复制 bundle 后**不带 entitlement** 重签 | ✅ | 可启动、数据完整、22/22 密钥 |
+
+### 两个根的成因
+
+**1. `Operation not permitted` 不是 TCC，是 `UF_COMPRESSED`**
+
+App Store 安装的 bundle 内所有文件都带压缩标志，即使 root 也无法就地写入：
+
+```bash
+find /Applications/WeChat.app -type f -flags +compressed | wc -l   # 本机 118
+ls -lO /Applications/WeChat.app/Contents/MacOS/WeChat             # 显示 compressed
+```
+
+`cp -R` 复制会解压（`find ... -flags +compressed` 归零），因此只能"复制 → 签副本 → 替换"。
+
+**2. 保留 `app-sandbox` 会导致启动失败**
+
+ad-hoc 签名没有 Team ID，但 entitlement 仍声称 `5A4RE8SF68.com.tencent.xinWeChat` 并要求沙盒容器；amfid 校验不到对应身份，直接拒绝 spawn（`POSIX 153`）。所以 App Store 沙盒版**不能**用 `--preserve-metadata=entitlements`，只能放弃沙盒 entitlement 才能启动。
+
+### 可用路径（复制 + 去 entitlement 重签）
+
+```bash
+# 1. 退出微信并复制（cp -R 会解压 UF_COMPRESSED）
+killall WeChat 2>/dev/null; sleep 2
+cp -R /Applications/WeChat.app /Applications/WeChat-adhoc.app
+
+# 2. 不带 entitlement 重签（去掉 app-sandbox，才能启动）
+codesign --force --deep --sign - /Applications/WeChat-adhoc.app
+
+# 3. 验证：flags 应为 0x2(adhoc)，无 runtime，entitlements 为空
+codesign -dv --verbose=4 /Applications/WeChat-adhoc.app 2>&1 | grep flags
+codesign -d --entitlements - /Applications/WeChat-adhoc.app 2>&1 | head -3
+
+# 4. 交换（原包留作回滚，命名不要带 .app 后缀，避免被 LaunchServices 当成第二个 App）
+mv /Applications/WeChat.app /Users/<user>/WeChat.official-backup
+mv /Applications/WeChat-adhoc.app /Applications/WeChat.app
+
+# 5. 启动并确认在读写原容器目录（数据未丢）
+open /Applications/WeChat.app
+lsof -p $(pgrep -f "WeChat.app/Contents/MacOS/WeChat" | head -1) | grep -c xwechat_files
+```
+
+> 以上需要 root 的步骤可用 `osascript -e 'do shell script "..." with administrator privileges'` 触发系统授权框，由用户在 GUI 输入密码。
+
+### 去沙盒后的两个连带影响
+
+| 影响 | 说明 |
+|------|------|
+| 失去沙盒隔离 | WeChat 以非沙盒身份运行，可访问全盘用户目录；这是安全性上的实际权衡 |
+| 数据目录不变 | 实测仍使用绝对路径 `~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files`，聊天记录不丢 |
+
+### 取密钥：root 枚举会被 TCC 拦住
+
+- **用户态**（有 FDA 的终端）能枚举到库，但只能靠 LLDB hook 拿到部分 key（本机 45s 窗口只拿到 3/22）
+- **root 态**（osascript / sudo）枚举返回 0：`ls` 该目录直接 0 行，属 TCC 完全磁盘访问问题，与签名无关
+
+绕过方式：用**硬链接**把 DB 挂到不受保护目录（不复制数据），让 root 在那边扫描：
+
+```bash
+SRC=~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/<账号>/db_storage
+DST=~/.wx-cli/probe-$(date +%H%M%S); mkdir -p "$DST"
+cd "$SRC" && find . -name "*.db" | while read -r f; do
+  mkdir -p "$DST/$(dirname "$f")"; ln "$f" "$DST/$f"
+done
+# 把 config.json 的 db_dir 临时指向 $DST，root 跑 wx key extract，完成后改回真实路径
+```
+
+本机结果：`找到 22 个加密数据库` → 读取约 2.6 GB 内存 → `22/22 全部匹配`。
+
+### `config.json` 的 `db_dir` 粒度（易错）
+
+| 写法 | 结果 |
+|------|------|
+| `.../xwechat_files`（根） | 枚举到 0 个库 |
+| `.../xwechat_files/<账号>` | 枚举到 0 个库 |
+| `.../xwechat_files/<账号>/db_storage` | ✅ 正确 |
+
+另一个坑：密钥更新后若仍报 `无法解密 session.db`，是 daemon 缓存了旧状态，`wx daemon stop` 后重跑即可。
+
+### 回滚
+
+```bash
+rm -rf /Applications/WeChat.app
+mv /Users/<user>/WeChat.official-backup /Applications/WeChat.app
+# 或直接官网重装微信
+```
+
+### 复发条件
+
+微信自动更新会写回官方签名，上述步骤需全部重做。判断方法：
+
+```bash
+codesign -dv --verbose=4 /Applications/WeChat.app 2>&1 | grep flags
+# 出现 runtime 即已被更新覆盖
+```
